@@ -1,0 +1,4 @@
+pybullet
+stable-baselines3[extra]
+gymnasium[classic-control]
+numpy
