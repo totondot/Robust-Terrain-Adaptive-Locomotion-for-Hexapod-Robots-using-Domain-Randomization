@@ -1,10 +1,13 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import pybullet as p
+import pybullet_data
 import numpy as np
 import os
 import random
-import pybullet_data
+
+# Get the absolute path to the directory containing this script
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class HexapodEnv(gym.Env):
     def __init__(self, render=False, time_step=0.01):
@@ -12,103 +15,163 @@ class HexapodEnv(gym.Env):
 
         self.render = render
         self.time_step = time_step
-        self.physicsClient = None
-        self.robot_id = None
-
-        # Define action space and observation space
-        self.action_space = spaces.Box(low=np.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]),
-                                       high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]), dtype=np.float32)
-
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
-
-    def generate_random_heightmap(self, size=256, max_height=0.2):
-        """
-        Generate random heightmap data.
-        :param size: Size of the grid (heightmap)
-        :param max_height: Max height for the terrain
-        :return: Random heightmap as flattened array
-        """
-        heightmap = np.random.uniform(low=-max_height, high=max_height, size=(size, size))
-        return heightmap.flatten().tolist()
-
-    def load_random_heightmap(self):
-        """
-        Select and load a random heightmap from the heightmaps folder.
-        """
-        heightmaps_folder = os.path.join(os.path.dirname(__file__), "../heightmaps")
-        heightmap_files = [f for f in os.listdir(heightmaps_folder) if f.endswith(".raw")]
-
-        # Choose a random file from the list
-        selected_file = random.choice(heightmap_files)
-        selected_file_path = os.path.join(heightmaps_folder, selected_file)
-        
-        # Load the heightmap file into PyBullet
-        terrain_id = p.createHeightfieldTerrainFromFile(
-            selected_file_path, 
-            numHeightfieldZ=256,  # Grid size of the heightmap
-            heightScale=1.0
-        )
-
-        print(f"Loaded terrain: {selected_file}")
-        return terrain_id
-
-    def reset(self, seed=None, options=None):
-        def add_obstacles(self):
-    # Add obstacles like cubes on the terrain
-            for _ in range(5):  # Add 5 random obstacles
-                x = np.random.uniform(-2, 2)
-                y = np.random.uniform(-2, 2)
-                z = np.random.uniform(0.2, 0.5)
-                size = np.random.uniform(0.05, 0.1)
-                p.createCollisionShape(p.GEOM_BOX, halfExtents=[size] * 3)
-                p.createMultiBody(basePosition=[x, y, z])
-
-        if self.physicsClient is not None:
-            p.disconnect(self.physicsClient)
-
         self.physicsClient = p.connect(p.GUI if self.render else p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(self.time_step)
+        p.setPhysicsEngineParameter(numSolverIterations=500)
 
-        # COMMENT OUT or REMOVE the heightfield loading:
-        # self.load_random_heightmap()
+        self.robot_id = -1
+        self.num_joints = 18
+        self.joint_indices = list(range(self.num_joints))
+        self.joint_names = [f"joint_{i}" for i in self.joint_indices]
+        self.joint_limits = [-1.57, 1.57]
 
-        # CREATE SIMPLE FLAT TERRAIN:
-        terrain_id = p.createCollisionShape(p.GEOM_PLANE)
-        terrain_visual_id = p.createVisualShape(p.GEOM_PLANE)
-        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=terrain_id, baseVisualShapeIndex=terrain_visual_id)
+        self.terrain_id = -1
+        self.episode_counter = 0
 
-        # Load hexapod model
-        hexapod_urdf = os.path.join(os.path.dirname(__file__), "../hexapod_model/pexod.urdf")
-        self.robot_id = p.loadURDF(hexapod_urdf, basePosition=[0, 0, 0.2], useFixedBase=False)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_joints,), dtype=np.float32)
 
-        # Return an initial observation (replace with actual state)
-        observation = np.zeros(12)
-        return observation, {}
+        num_obs = 3 + 4 + 3 + 3 + self.num_joints + self.num_joints
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(num_obs,), dtype=np.float32)
+
+    def load_random_heightmap(self):
+        heightmaps_folder = os.path.join(CURRENT_DIR, "heightmaps")
+        
+        if not os.path.exists(heightmaps_folder) or not os.listdir(heightmaps_folder):
+            print("No heightmap files found. Please run generate_raw_heightmap.py first.")
+            return -1
+        
+        heightmap_files = [f for f in os.listdir(heightmaps_folder) if f.endswith(".raw")]
+        selected_file = random.choice(heightmap_files)
+        selected_file_path = os.path.join(heightmaps_folder, selected_file)
+
+        width = 256
+        length = 256
+        with open(selected_file_path, 'rb') as f:
+            heightfield_data = np.frombuffer(f.read(), dtype=np.float16).reshape((width, length))
+
+        heightfield_data_pybullet = heightfield_data.flatten().tolist()
+        
+        terrain_shape = p.createCollisionShape(
+            p.GEOM_HEIGHTFIELD, 
+            meshScale=[0.5, 0.5, 1],
+            heightfieldTextureScaling=width,
+            heightfieldData=heightfield_data_pybullet,
+            numHeightfieldRows=width,
+            numHeightfieldColumns=length
+        )
+        
+        terrain_id = p.createMultiBody(
+            baseMass=0, 
+            baseCollisionShapeIndex=terrain_shape, 
+            basePosition=[0, 0, 0]
+        )
+
+        # FIX: Load the texture from the local directory
+        texture_path = os.path.join(CURRENT_DIR, "checkerboard.png")
+        if os.path.exists(texture_path):
+            p.changeVisualShape(terrain_id, -1, textureUniqueId=p.loadTexture(texture_path))
+        else:
+            print(f"Warning: Texture file not found at {texture_path}. Using a solid color.")
+            p.changeVisualShape(terrain_id, -1, rgbaColor=[0.8, 0.8, 0.8, 1])
+        
+        return terrain_id
+
+    def get_observation(self):
+        if self.robot_id == -1:
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
+
+        position, orientation_quat = p.getBasePositionAndOrientation(self.robot_id)
+        linear_velocity, angular_velocity = p.getBaseVelocity(self.robot_id)
+
+        joint_states = p.getJointStates(self.robot_id, self.joint_indices)
+        joint_positions = [state[0] for state in joint_states]
+        joint_velocities = [state[1] for state in joint_states]
+
+        observation = np.concatenate([
+            np.array(position),
+            np.array(orientation_quat),
+            np.array(linear_velocity),
+            np.array(angular_velocity),
+            np.array(joint_positions),
+            np.array(joint_velocities)
+        ]).astype(np.float32)
+
+        return observation
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.81)
+        p.setTimeStep(self.time_step)
+
+        if self.terrain_id != -1:
+            try:
+                p.removeBody(self.terrain_id)
+            except p.error:
+                pass
+
+        self.terrain_id = self.load_random_heightmap()
+        if self.terrain_id == -1:
+            print("Using default flat plane as a fallback.")
+            self.terrain_id = p.loadURDF("plane.urdf")
+
+        start_pos = [0, 0, 0.5]
+        start_ori = p.getQuaternionFromEuler([0, 0, 0])
+        
+        urdf_path = os.path.join(CURRENT_DIR, "pexod.urdf")
+
+        if not os.path.exists(urdf_path):
+            raise FileNotFoundError(f"URDF file not found at: {urdf_path}.")
+
+        self.robot_id = p.loadURDF(urdf_path, start_pos, start_ori)
+        self.num_joints = p.getNumJoints(self.robot_id)
+        self.joint_indices = list(range(self.num_joints))
+
+        for i in self.joint_indices:
+            p.resetJointState(self.robot_id, i, 0.0)
+
+        observation = self.get_observation()
+        self.initial_base_pos = observation[:3].copy()
+        
+        info = {}
+        return observation, info
 
     def step(self, action):
-        # Apply action to the environment (control the hexapod)
-        # For now, you should apply actions to your robot here
-        # e.g., applying forces to the hexapod's joints
+        if self.robot_id == -1:
+            return self.get_observation(), 0, True, False, {}
+
+        scaled_action = self.joint_limits[0] + (action + 1.0) * (self.joint_limits[1] - self.joint_limits[0]) / 2.0
         
-        # Get the current state of the environment (this is your observation)
-        observation = np.zeros(12)  # Update with actual robot state
+        p.setJointMotorControlArray(
+            bodyUniqueId=self.robot_id,
+            jointIndices=self.joint_indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=scaled_action,
+            forces=[500] * self.num_joints
+        )
 
-        # Calculate reward (for now it's a dummy value)
-        reward = 1.0
+        p.stepSimulation()
 
-        # Check if the episode is done (you can add your logic here)
-        done = False
+        observation = self.get_observation()
+        current_base_pos = observation[:3]
+        
+        forward_progress = current_base_pos[0] - self.initial_base_pos[0]
+        
+        pitch, roll, _ = p.getEulerFromQuaternion(observation[3:7])
+        pitch_roll_penalty = - (pitch**2 + roll**2) * 0.1
 
-        # Truncated indicates if the episode is truncated (e.g., if max time is exceeded)
-        truncated = False  # Set to True if the environment is truncated based on some condition
+        joint_vels = observation[18:]
+        joint_vel_penalty = - np.sum(np.abs(joint_vels)) * 0.001
 
-        # Return the observation, reward, done, truncated, and info (empty)
+        reward = forward_progress + pitch_roll_penalty + joint_vel_penalty
+
+        done = current_base_pos[2] < 0.15 or np.abs(pitch) > 0.5 or np.abs(roll) > 0.5
+        truncated = False
+
         info = {}
         return observation, reward, done, truncated, info
-    def render(self, mode="human"):
-        """
-        Render the environment (if applicable)
-        """
-        pass
+
+    def close(self):
+        p.disconnect()
