@@ -1,26 +1,33 @@
 import numpy as np
-import struct
+import os
+from perlin_noise import PerlinNoise
 
-def generate_random_heightmap(size=256, max_height=0.2, filename="random_terrain.raw"):
-    """
-    Generate a random heightmap and save it as a raw file.
-    :param size: Size of the heightmap grid (e.g., 256x256)
-    :param max_height: Maximum height variation (range between -max_height and +max_height)
-    :param filename: The name of the output file
-    """
+# Set a random seed for reproducibility
+np.random.seed(42)
 
-    # Generate random terrain values between -max_height and +max_height
-    heightmap = np.random.uniform(low=-max_height, high=max_height, size=(size, size))
+def generate_and_save_heightmap(filename, width=256, length=256, scale=1.0):
+    """
+    Generates a heightmap using Perlin noise and saves it as a .raw file.
+    """
+    noise = PerlinNoise(octaves=4, seed=np.random.randint(0, 10000))
+    xpix, ypix = width, length
+    heightmap = np.array([[noise([i/xpix, j/ypix]) for j in range(xpix)] for i in range(ypix)])
     
-    # Flatten the heightmap to a 1D array for saving
-    heightmap_flat = heightmap.flatten()
+    # Scale the heightmap to a reasonable range
+    heightmap = (heightmap - heightmap.min()) / (heightmap.max() - heightmap.min())
+    heightmap = (heightmap * scale).astype(np.float16)
 
-    # Write the heightmap to a raw binary file
-    with open(filename, "wb") as f:
-        # Write the heightmap as 32-bit float values
-        for value in heightmap_flat:
-            f.write(struct.pack('f', value))
-    print(f"Heightmap saved to {filename}")
+    with open(filename, 'wb') as f:
+        f.write(heightmap.tobytes())
 
-# Generate a random heightmap and save it
-generate_random_heightmap(size=256, max_height=0.2)
+if __name__ == "__main__":
+    heightmaps_folder = os.path.join(os.path.dirname(__file__), "heightmaps")
+    if not os.path.exists(heightmaps_folder):
+        os.makedirs(heightmaps_folder)
+        print(f"Created folder: {heightmaps_folder}")
+    
+    num_maps_to_generate = 5
+    for i in range(num_maps_to_generate):
+        filename = os.path.join(heightmaps_folder, f"heightmap_{i}.raw")
+        generate_and_save_heightmap(filename, scale=1.0)
+        print(f"Generated and saved: {filename}")
