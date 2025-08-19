@@ -5,10 +5,10 @@ This project focuses on training a hexapod robot to walk robustly over various t
 Prerequisites
 To run this simulation, you will need to have Python and the following libraries installed.
 
-**pybullet: **The core physics simulation engine for the environment.
-**numpy: **Used for all numerical operations and data handling.
-**gymnasium: **Provides the standard API for reinforcement learning environments.
-**stable-baselines3: **An implementation of popular reinforcement learning algorithms, including PPO, which is used for training the robot.
+**pybullet:** The core physics simulation engine for the environment.
+**numpy:** Used for all numerical operations and data handling.
+**gymnasium:** Provides the standard API for reinforcement learning environments.
+**stable-baselines3:** An implementation of popular reinforcement learning algorithms, including PPO, which is used for training the robot.
 
 File Sequence
 The project is structured as a Python package. Here is the purpose of each main file:
