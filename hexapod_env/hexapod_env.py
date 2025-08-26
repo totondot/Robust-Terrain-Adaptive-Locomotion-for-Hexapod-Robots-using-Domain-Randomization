@@ -1,177 +1,185 @@
 import gymnasium as gym
 from gymnasium import spaces
+import numpy as np
 import pybullet as p
 import pybullet_data
-import numpy as np
 import os
+import glob
 import random
 
-# Get the absolute path to the directory containing this script
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 class HexapodEnv(gym.Env):
-    def __init__(self, render=False, time_step=0.01):
+    """
+    A Gym environment for the hexapod robot simulation in PyBullet.
+    """
+    def __init__(self, urdf_path, texture_path, terrains_path, time_step=1.0/240.0):
         super(HexapodEnv, self).__init__()
 
-        self.render = render
+        self.urdf_path = urdf_path
+        self.texture_path = texture_path
+        self.terrains_path = terrains_path
         self.time_step = time_step
-        self.physicsClient = p.connect(p.GUI if self.render else p.DIRECT)
+        self.client = p.connect(p.GUI)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        
+        # FIX: Add the terrains path to PyBullet's search paths to allow it to find the URDFs.
+        # This is the key change to visualize the terrains.
+        if os.path.exists(self.terrains_path):
+            p.setAdditionalSearchPath(self.terrains_path)
+            
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(self.time_step)
-        p.setPhysicsEngineParameter(numSolverIterations=500)
 
-        self.robot_id = -1
-        self.num_joints = 18
-        self.joint_indices = list(range(self.num_joints))
-        self.joint_names = [f"joint_{i}" for i in self.joint_indices]
-        self.joint_limits = [-1.57, 1.57]
+        self.robot_id = None
+        self.joint_indices = list(range(18))
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(18,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(49,), dtype=np.float32)
 
-        self.terrain_id = -1
-        self.episode_counter = 0
-
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_joints,), dtype=np.float32)
-
-        num_obs = 3 + 4 + 3 + 3 + self.num_joints + self.num_joints
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(num_obs,), dtype=np.float32)
-
-    def load_random_heightmap(self):
-        heightmaps_folder = os.path.join(CURRENT_DIR, "heightmaps")
+        # Reward weights
+        self.forward_vel_weight = 1.0
+        self.height_weight = 0.5
+        self.uprightness_weight = 0.1
+        self.joint_vel_weight = 0.001
+        self.desired_height = 0.3
+        self.max_steps = 2048
+        self.current_steps = 0
         
-        if not os.path.exists(heightmaps_folder) or not os.listdir(heightmaps_folder):
-            print("No heightmap files found. Please run generate_raw_heightmap.py first.")
-            return -1
+
+    def _get_obs(self):
+        """
+        Returns the current observation of the environment.
+        """
+        # Get robot state
+        robot_pos, robot_ori = p.getBasePositionAndOrientation(self.robot_id)
+        robot_vel, robot_angular_vel = p.getBaseVelocity(self.robot_id)
         
-        heightmap_files = [f for f in os.listdir(heightmaps_folder) if f.endswith(".raw")]
-        selected_file = random.choice(heightmap_files)
-        selected_file_path = os.path.join(heightmaps_folder, selected_file)
-
-        width = 256
-        length = 256
-        with open(selected_file_path, 'rb') as f:
-            heightfield_data = np.frombuffer(f.read(), dtype=np.float16).reshape((width, length))
-
-        heightfield_data_pybullet = heightfield_data.flatten().tolist()
-        
-        terrain_shape = p.createCollisionShape(
-            p.GEOM_HEIGHTFIELD, 
-            meshScale=[0.5, 0.5, 1],
-            heightfieldTextureScaling=width,
-            heightfieldData=heightfield_data_pybullet,
-            numHeightfieldRows=width,
-            numHeightfieldColumns=length
-        )
-        
-        terrain_id = p.createMultiBody(
-            baseMass=0, 
-            baseCollisionShapeIndex=terrain_shape, 
-            basePosition=[0, 0, 0]
-        )
-
-        # FIX: Load the texture from the local directory
-        texture_path = os.path.join(CURRENT_DIR, "checkerboard.png")
-        if os.path.exists(texture_path):
-            p.changeVisualShape(terrain_id, -1, textureUniqueId=p.loadTexture(texture_path))
-        else:
-            print(f"Warning: Texture file not found at {texture_path}. Using a solid color.")
-            p.changeVisualShape(terrain_id, -1, rgbaColor=[0.8, 0.8, 0.8, 1])
-        
-        return terrain_id
-
-    def get_observation(self):
-        if self.robot_id == -1:
-            return np.zeros(self.observation_space.shape, dtype=np.float32)
-
-        position, orientation_quat = p.getBasePositionAndOrientation(self.robot_id)
-        linear_velocity, angular_velocity = p.getBaseVelocity(self.robot_id)
-
+        # Get joint states
         joint_states = p.getJointStates(self.robot_id, self.joint_indices)
         joint_positions = [state[0] for state in joint_states]
         joint_velocities = [state[1] for state in joint_states]
 
-        observation = np.concatenate([
-            np.array(position),
-            np.array(orientation_quat),
-            np.array(linear_velocity),
-            np.array(angular_velocity),
-            np.array(joint_positions),
-            np.array(joint_velocities)
+        # Concatenate all observations
+        obs = np.concatenate([
+            robot_pos,
+            robot_ori,
+            robot_vel,
+            robot_angular_vel,
+            joint_positions,
+            joint_velocities
         ]).astype(np.float32)
 
-        return observation
+        return obs
+
+    def _compute_reward(self):
+        """
+        Calculates the reward based on the current state of the robot.
+        """
+        robot_pos, robot_ori = p.getBasePositionAndOrientation(self.robot_id)
+        robot_vel, _ = p.getBaseVelocity(self.robot_id)
+        
+        # Calculate forward velocity reward
+        forward_vel_reward = self.forward_vel_weight * robot_vel[0]
+
+        # Calculate height reward
+        height_reward = -self.height_weight * abs(robot_pos[2] - self.desired_height)
+
+        # Calculate uprightness penalty
+        pitch = p.getEulerFromQuaternion(robot_ori)[1]
+        roll = p.getEulerFromQuaternion(robot_ori)[0]
+        uprightness_penalty = -self.uprightness_weight * (abs(pitch) + abs(roll))
+
+        # Calculate joint velocity penalty
+        joint_states = p.getJointStates(self.robot_id, self.joint_indices)
+        joint_velocities = np.array([state[1] for state in joint_states])
+        joint_vel_penalty = -self.joint_vel_weight * np.sum(np.square(joint_velocities))
+
+        # Sum all rewards
+        total_reward = forward_vel_reward + height_reward + uprightness_penalty + joint_vel_penalty
+
+        return total_reward
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         p.resetSimulation()
-        p.setGravity(0, 0, -9.81)
-        p.setTimeStep(self.time_step)
 
-        if self.terrain_id != -1:
-            try:
-                p.removeBody(self.terrain_id)
-            except p.error:
-                pass
-
-        self.terrain_id = self.load_random_heightmap()
-        if self.terrain_id == -1:
-            print("Using default flat plane as a fallback.")
-            self.terrain_id = p.loadURDF("plane.urdf")
-
+        # Implement domain randomization
+        # This now relies on the terrains path being added to PyBullet's search paths
+        if os.path.exists(self.terrains_path) and os.path.isdir(self.terrains_path):
+            terrain_files = glob.glob(os.path.join(self.terrains_path, "*.urdf"))
+            if terrain_files:
+                random_terrain_file = random.choice(terrain_files)
+                p.loadURDF(random_terrain_file)
+            else:
+                p.loadURDF("plane.urdf")
+        else:
+            p.loadURDF("plane.urdf")
+        
+        if os.path.exists(self.texture_path):
+            texture_id = p.loadTexture(self.texture_path)
+            p.changeVisualShape(bodyUniqueId=0, linkIndex=-1, textureUniqueId=texture_id)
+        
         start_pos = [0, 0, 0.5]
         start_ori = p.getQuaternionFromEuler([0, 0, 0])
         
-        urdf_path = os.path.join(CURRENT_DIR, "pexod.urdf")
+        # Check if the URDF path is valid before loading
+        if os.path.exists(self.urdf_path):
+            self.robot_id = p.loadURDF(self.urdf_path, start_pos, start_ori, useFixedBase=False)
+        else:
+            print(f"Error: URDF file not found at {self.urdf_path}. Cannot spawn robot.")
+            # Set robot_id to None so subsequent functions don't fail
+            self.robot_id = None
 
-        if not os.path.exists(urdf_path):
-            raise FileNotFoundError(f"URDF file not found at: {urdf_path}.")
 
-        self.robot_id = p.loadURDF(urdf_path, start_pos, start_ori)
-        self.num_joints = p.getNumJoints(self.robot_id)
-        self.joint_indices = list(range(self.num_joints))
-
-        for i in self.joint_indices:
-            p.resetJointState(self.robot_id, i, 0.0)
-
-        observation = self.get_observation()
-        self.initial_base_pos = observation[:3].copy()
+        # Only try to reset joints if the robot was successfully loaded
+        if self.robot_id is not None:
+            for i in range(p.getNumJoints(self.robot_id)):
+                p.resetJointState(self.robot_id, i, 0.0)
         
+        # Reset step counter
+        self.current_steps = 0
+
+        obs = self._get_obs()
         info = {}
-        return observation, info
+        return obs, info
 
     def step(self, action):
-        if self.robot_id == -1:
-            return self.get_observation(), 0, True, False, {}
-
-        scaled_action = self.joint_limits[0] + (action + 1.0) * (self.joint_limits[1] - self.joint_limits[0]) / 2.0
+        """
+        Takes a step in the environment given an action.
+        """
+        # Apply action to joints only if the robot exists
+        if self.robot_id is not None:
+            # FIX: Reduce the force to prevent the robot from flying off
+            p.setJointMotorControlArray(
+                bodyUniqueId=self.robot_id,
+                jointIndices=self.joint_indices,
+                controlMode=p.POSITION_CONTROL,
+                targetPositions=action,
+                forces=[10] * 18 # Changed from 500 to 10
+            )
         
-        p.setJointMotorControlArray(
-            bodyUniqueId=self.robot_id,
-            jointIndices=self.joint_indices,
-            controlMode=p.POSITION_CONTROL,
-            targetPositions=scaled_action,
-            forces=[500] * self.num_joints
-        )
-
         p.stepSimulation()
+        self.current_steps += 1
 
-        observation = self.get_observation()
-        current_base_pos = observation[:3]
-        
-        forward_progress = current_base_pos[0] - self.initial_base_pos[0]
-        
-        pitch, roll, _ = p.getEulerFromQuaternion(observation[3:7])
-        pitch_roll_penalty = - (pitch**2 + roll**2) * 0.1
-
-        joint_vels = observation[18:]
-        joint_vel_penalty = - np.sum(np.abs(joint_vels)) * 0.001
-
-        reward = forward_progress + pitch_roll_penalty + joint_vel_penalty
-
-        done = current_base_pos[2] < 0.15 or np.abs(pitch) > 0.5 or np.abs(roll) > 0.5
-        truncated = False
-
+        # Get state and reward
+        obs = self._get_obs()
+        reward = self._compute_reward()
+        terminated = self._is_terminated()
+        truncated = self.current_steps >= self.max_steps
         info = {}
-        return observation, reward, done, truncated, info
+
+        return obs, reward, terminated, truncated, info
+    
+    def _is_terminated(self):
+        """
+        Checks if the episode has terminated.
+        """
+        # Only check if the robot exists in the simulation
+        if self.robot_id is not None:
+            robot_pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+            # Terminate if the robot falls over
+            if robot_pos[2] < 0.15:
+                return True
+        return False
 
     def close(self):
-        p.disconnect()
+        p.disconnect(self.client)
+
